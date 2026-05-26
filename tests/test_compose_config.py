@@ -111,3 +111,87 @@ def test_services_share_a_user_defined_network():
     assert shared <= declared, (
         f"shared networks {shared} must be declared at top level: {declared}"
     )
+
+
+def test_compose_declares_a_green_app_service():
+    compose = load_compose()
+    services = compose.get("services", {})
+    assert "app_green" in services, (
+        "compose must define an 'app_green' service so the rollout script "
+        "can bring it up alongside the running blue instance"
+    )
+
+
+def test_green_service_is_gated_by_green_profile():
+    compose = load_compose()
+    green = compose["services"]["app_green"]
+    profiles = green.get("profiles", [])
+    assert "green" in profiles, (
+        "app_green must sit behind the 'green' compose profile so a plain "
+        "`docker compose up` never starts both colors at once"
+    )
+
+
+def test_blue_service_is_not_profile_gated():
+    compose = load_compose()
+    blue = compose["services"]["app"]
+    profiles = blue.get("profiles", [])
+    assert not profiles, (
+        "the blue service (named 'app') must be the default profile so "
+        "the baseline stack still comes up without profile flags"
+    )
+
+
+def test_green_service_shares_blue_build_context():
+    compose = load_compose()
+    blue_build = compose["services"]["app"].get("build")
+    green_build = compose["services"]["app_green"].get("build")
+    assert green_build == blue_build, (
+        "both colors must build from the same image so a green rollout "
+        "ships the same code that has been tested as blue"
+    )
+
+
+def test_green_service_joins_the_shared_edge_network():
+    compose = load_compose()
+    green_nets = set(compose["services"]["app_green"].get("networks", []))
+    proxy_nets = set(compose["services"]["proxy"].get("networks", []))
+    assert green_nets & proxy_nets, (
+        "app_green must share a network with the proxy so the proxy can "
+        "reach the green instance when traffic is cut over"
+    )
+
+
+def test_green_service_declares_its_own_healthcheck():
+    compose = load_compose()
+    green = compose["services"]["app_green"]
+    healthcheck = green.get("healthcheck")
+    assert healthcheck is not None, (
+        "app_green must declare a healthcheck so `docker compose up --wait` "
+        "can block until the new color reports ready"
+    )
+    test_cmd = healthcheck.get("test")
+    joined = " ".join(test_cmd) if isinstance(test_cmd, list) else str(test_cmd)
+    assert "/ready" in joined, (
+        "the green healthcheck must probe /ready, the same readiness probe "
+        "step 2 wired for blue"
+    )
+
+
+def test_color_labels_are_set_on_both_services():
+    compose = load_compose()
+    blue_labels = compose["services"]["app"].get("labels", {})
+    green_labels = compose["services"]["app_green"].get("labels", {})
+
+    def get_label(labels, key):
+        if isinstance(labels, list):
+            for entry in labels:
+                if entry.startswith(f"{key}="):
+                    return entry.split("=", 1)[1]
+            return None
+        return labels.get(key)
+
+    blue_color = get_label(blue_labels, "com.vytharion.rollout.color")
+    green_color = get_label(green_labels, "com.vytharion.rollout.color")
+    assert blue_color == "blue"
+    assert green_color == "green"

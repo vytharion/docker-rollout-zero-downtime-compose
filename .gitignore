@@ -10,6 +10,9 @@ CLAUDE.md
 .pipeline-state.json
 .pipeline-state.*.tmp
 
+# Rollout runtime state (per-host, never published)
+state/
+
 # Common build / runtime artifacts (cleanup phase wipes these locally)
 node_modules/
 dist/

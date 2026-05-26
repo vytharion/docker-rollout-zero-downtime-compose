@@ -1,3 +1,12 @@
+x-app-healthcheck: &app-healthcheck
+  test:
+    - CMD-SHELL
+    - python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/ready', timeout=2); sys.exit(0 if r.status == 200 else 1)"
+  interval: 10s
+  timeout: 3s
+  retries: 3
+  start_period: 5s
+
 services:
   app:
     build:
@@ -5,19 +14,34 @@ services:
     environment:
       APP_PORT: "8000"
       APP_VERSION: "v1"
+      APP_REPLICA_ID: "blue"
       APP_READY_AFTER_SECONDS: "0"
     expose:
       - "8000"
     networks:
       - edge
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/ready', timeout=2); sys.exit(0 if r.status == 200 else 1)"
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
+    labels:
+      com.vytharion.rollout.color: "blue"
+    healthcheck: *app-healthcheck
+    restart: unless-stopped
+
+  app_green:
+    build:
+      context: ./app
+    environment:
+      APP_PORT: "8000"
+      APP_VERSION: "v2"
+      APP_REPLICA_ID: "green"
+      APP_READY_AFTER_SECONDS: "0"
+    expose:
+      - "8000"
+    networks:
+      - edge
+    labels:
+      com.vytharion.rollout.color: "green"
+    profiles:
+      - green
+    healthcheck: *app-healthcheck
     restart: unless-stopped
 
   proxy:
