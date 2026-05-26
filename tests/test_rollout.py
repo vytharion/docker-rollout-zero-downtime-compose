@@ -16,17 +16,26 @@ from scripts.rollout import (
     BLUE,
     COLORS,
     GREEN,
+    ROLLED_BACK_EXIT_CODE,
     CutoverPlan,
     RolloutPlan,
+    SmokePlan,
     compose_up_command,
+    default_prober,
     execute_cutover,
     execute_plan,
+    execute_rollback,
+    execute_rollout,
     next_color,
     nginx_reload_command,
+    parse_args,
     plan_cutover,
     plan_next_rollout,
+    plan_rollback,
+    plan_smoke_test,
     read_active_color,
     render_upstream_conf,
+    run_smoke_test,
     service_for_color,
     upstream_directive_for_color,
     write_active_color,
@@ -482,3 +491,468 @@ def test_round_trip_two_cutovers_swap_color_twice(tmp_path: Path):
     assert "server app:8000;" in body
     assert "app_green" not in body
     assert read_active_color(state) == BLUE
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Smoke tests + automatic rollback
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_plan_is_immutable():
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=3,
+        timeout_seconds=1.0,
+        attempt_delay_seconds=0.1,
+    )
+    with pytest.raises(Exception):
+        plan.expected_status = 503  # type: ignore[misc]
+
+
+def test_smoke_plan_describe_renders_human_readable_summary():
+    plan = SmokePlan(
+        probe_url="http://localhost:8080/",
+        expected_status=200,
+        attempts=5,
+        timeout_seconds=2.0,
+        attempt_delay_seconds=1.0,
+    )
+    line = plan.describe()
+    assert "http://localhost:8080/" in line
+    assert "expect=200" in line
+    assert "attempts=5" in line
+    assert "timeout=2.0s" in line
+
+
+def test_plan_smoke_test_uses_provided_values():
+    plan = plan_smoke_test(
+        probe_url="http://localhost:9999/",
+        expected_status=204,
+        attempts=2,
+        timeout_seconds=0.5,
+        attempt_delay_seconds=0.25,
+    )
+    assert plan.probe_url == "http://localhost:9999/"
+    assert plan.expected_status == 204
+    assert plan.attempts == 2
+    assert plan.timeout_seconds == 0.5
+    assert plan.attempt_delay_seconds == 0.25
+
+
+def test_plan_smoke_test_clamps_attempts_to_at_least_one():
+    """A zero-attempt smoke would skip probing entirely and never roll back."""
+    plan = plan_smoke_test(attempts=0)
+    assert plan.attempts == 1
+
+
+def test_plan_smoke_test_clamps_negative_timeout():
+    plan = plan_smoke_test(timeout_seconds=-1.0)
+    assert plan.timeout_seconds > 0
+
+
+def test_plan_smoke_test_clamps_negative_delay():
+    plan = plan_smoke_test(attempt_delay_seconds=-5.0)
+    assert plan.attempt_delay_seconds == 0.0
+
+
+def test_run_smoke_test_returns_true_on_first_matching_probe():
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=3,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+    calls: list[tuple[str, float]] = []
+
+    def fake_prober(url: str, timeout: float) -> int:
+        calls.append((url, timeout))
+        return 200
+
+    sleeps: list[float] = []
+    assert run_smoke_test(plan, prober=fake_prober, sleeper=sleeps.append) is True
+    assert calls == [("http://x/", 0.1)]
+    assert sleeps == []
+
+
+def test_run_smoke_test_retries_until_match():
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=5,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.05,
+    )
+    statuses = iter([503, 503, 200])
+
+    def fake_prober(_url: str, _timeout: float) -> int:
+        return next(statuses)
+
+    sleeps: list[float] = []
+    assert run_smoke_test(plan, prober=fake_prober, sleeper=sleeps.append) is True
+    assert sleeps == [0.05, 0.05]
+
+
+def test_run_smoke_test_returns_false_when_all_attempts_fail():
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=3,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+
+    def fake_prober(_url: str, _timeout: float) -> int:
+        return 500
+
+    assert run_smoke_test(plan, prober=fake_prober, sleeper=lambda _t: None) is False
+
+
+def test_run_smoke_test_treats_zero_status_as_failure():
+    """A prober returns 0 when the probe can't even connect — same as 5xx."""
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=2,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+    statuses = iter([0, 200])
+
+    def fake_prober(_url: str, _timeout: float) -> int:
+        return next(statuses)
+
+    assert run_smoke_test(plan, prober=fake_prober, sleeper=lambda _t: None) is True
+
+
+def test_run_smoke_test_does_not_sleep_after_last_attempt():
+    """Final failure must not leave the rollback sitting on a sleeper."""
+    plan = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=3,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.5,
+    )
+
+    def fake_prober(_url: str, _timeout: float) -> int:
+        return 500
+
+    sleeps: list[float] = []
+    assert run_smoke_test(plan, prober=fake_prober, sleeper=sleeps.append) is False
+    # 3 attempts → 2 inter-attempt sleeps, never a trailing one.
+    assert sleeps == [0.5, 0.5]
+
+
+def test_run_smoke_test_passes_url_and_timeout_to_prober():
+    plan = SmokePlan(
+        probe_url="https://example.test/healthz",
+        expected_status=204,
+        attempts=1,
+        timeout_seconds=3.5,
+        attempt_delay_seconds=0.0,
+    )
+    captured: list[tuple[str, float]] = []
+
+    def fake_prober(url: str, timeout: float) -> int:
+        captured.append((url, timeout))
+        return 204
+
+    run_smoke_test(plan, prober=fake_prober, sleeper=lambda _t: None)
+    assert captured == [("https://example.test/healthz", 3.5)]
+
+
+def test_default_prober_returns_zero_when_connection_refused(monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", explode)
+    assert default_prober("http://does-not-matter/", timeout=0.1) == 0
+
+
+def test_plan_rollback_swaps_from_and_to_colors():
+    cutover = CutoverPlan(
+        from_color=BLUE,
+        to_color=GREEN,
+        upstream_path=Path("/tmp/u.conf"),
+        upstream_body="server app_green:8000;\n",
+        reload_command=("docker", "exec", "proxy", "nginx", "-s", "reload"),
+    )
+    rb = plan_rollback(cutover)
+    assert rb.from_color == GREEN
+    assert rb.to_color == BLUE
+
+
+def test_plan_rollback_points_upstream_back_at_original_color():
+    cutover = CutoverPlan(
+        from_color=BLUE,
+        to_color=GREEN,
+        upstream_path=Path("/tmp/u.conf"),
+        upstream_body="server app_green:8000;\n",
+        reload_command=("docker", "exec", "proxy", "nginx", "-s", "reload"),
+    )
+    rb = plan_rollback(cutover)
+    assert "server app:8000;" in rb.upstream_body
+    assert "app_green" not in rb.upstream_body
+
+
+def test_plan_rollback_preserves_upstream_path_and_reload_command(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    cutover = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+    rb = plan_rollback(cutover)
+    assert rb.reload_command == cutover.reload_command
+    assert rb.upstream_path == cutover.upstream_path
+
+
+def test_plan_rollback_respects_custom_port():
+    cutover = CutoverPlan(
+        from_color=BLUE,
+        to_color=GREEN,
+        upstream_path=Path("/tmp/u.conf"),
+        upstream_body="server app_green:9090;\n",
+        reload_command=("docker", "exec", "proxy", "nginx", "-s", "reload"),
+        port=9090,
+    )
+    rb = plan_rollback(cutover)
+    assert "server app:9090;" in rb.upstream_body
+    assert rb.port == 9090
+
+
+def test_execute_rollback_restores_original_upstream_and_state(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    execute_cutover(cutover, runner=lambda _c: 0, state_path=state)
+    assert read_active_color(state) == GREEN
+
+    rc = execute_rollback(cutover, runner=lambda _c: 0, state_path=state)
+    assert rc == 0
+    assert read_active_color(state) == BLUE
+    body = upstream.read_text(encoding="utf-8")
+    assert "server app:8000;" in body
+    assert "app_green" not in body
+
+
+def test_execute_rollback_does_not_advance_state_when_reload_fails(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    execute_cutover(cutover, runner=lambda _c: 0, state_path=state)
+
+    rc = execute_rollback(cutover, runner=lambda _c: 5, state_path=state)
+    assert rc == 5
+    # State must remain at green: nginx never accepted the rollback config,
+    # so the bookkeeping has to match what the proxy is actually serving.
+    assert read_active_color(state) == GREEN
+
+
+def test_execute_rollout_happy_path_swaps_state_to_new_color(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_next_rollout(state_path=state)
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    smoke = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=1,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+    rc = execute_rollout(
+        plan,
+        cutover,
+        smoke,
+        runner=lambda _c: 0,
+        prober=lambda _u, _t: 200,
+        sleeper=lambda _t: None,
+        state_path=state,
+    )
+    assert rc == 0
+    assert read_active_color(state) == GREEN
+
+
+def test_execute_rollout_returns_rollback_code_when_smoke_fails(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_next_rollout(state_path=state)
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    smoke = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=2,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+
+    rc = execute_rollout(
+        plan,
+        cutover,
+        smoke,
+        runner=lambda _c: 0,
+        prober=lambda _u, _t: 503,
+        sleeper=lambda _t: None,
+        state_path=state,
+    )
+    assert rc == ROLLED_BACK_EXIT_CODE
+    # Service must be back on the original color, both at the proxy and
+    # in the on-disk bookkeeping.
+    assert read_active_color(state) == BLUE
+    body = upstream.read_text(encoding="utf-8")
+    assert "server app:8000;" in body
+    assert "app_green" not in body
+
+
+def test_execute_rollout_runs_smoke_after_cutover(tmp_path: Path):
+    """Order invariant: probe never fires until both compose-up and reload return."""
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_next_rollout(state_path=state)
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    smoke = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=1,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+
+    events: list[str] = []
+
+    def runner(_cmd):
+        events.append("runner")
+        return 0
+
+    def prober(_u, _t):
+        events.append("probe")
+        return 200
+
+    execute_rollout(
+        plan,
+        cutover,
+        smoke,
+        runner=runner,
+        prober=prober,
+        sleeper=lambda _t: None,
+        state_path=state,
+    )
+    # 2 runner calls (compose up, nginx reload) followed by 1 probe.
+    assert events == ["runner", "runner", "probe"]
+
+
+def test_execute_rollout_skips_smoke_and_rollback_when_compose_up_fails(
+    tmp_path: Path,
+):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_next_rollout(state_path=state)
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    smoke = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=2,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+
+    probe_calls = [0]
+
+    def prober(_u, _t):
+        probe_calls[0] += 1
+        return 200
+
+    rc = execute_rollout(
+        plan,
+        cutover,
+        smoke,
+        runner=lambda _c: 3,
+        prober=prober,
+        sleeper=lambda _t: None,
+        state_path=state,
+    )
+    assert rc == 3
+    assert probe_calls[0] == 0
+    # State stays untouched if compose up never succeeded.
+    assert read_active_color(state) == BLUE
+
+
+def test_execute_rollout_skips_smoke_when_reload_fails(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_next_rollout(state_path=state)
+    cutover = plan_cutover(state_path=state, upstream_path=upstream)
+    smoke = SmokePlan(
+        probe_url="http://x/",
+        expected_status=200,
+        attempts=2,
+        timeout_seconds=0.1,
+        attempt_delay_seconds=0.0,
+    )
+
+    runner_calls = [0]
+
+    def runner(_cmd):
+        runner_calls[0] += 1
+        # First call is compose up (succeeds), second is reload (fails).
+        return 0 if runner_calls[0] == 1 else 4
+
+    probe_calls = [0]
+
+    def prober(_u, _t):
+        probe_calls[0] += 1
+        return 200
+
+    rc = execute_rollout(
+        plan,
+        cutover,
+        smoke,
+        runner=runner,
+        prober=prober,
+        sleeper=lambda _t: None,
+        state_path=state,
+    )
+    assert rc == 4
+    assert probe_calls[0] == 0
+    # execute_cutover left state untouched because reload failed.
+    assert read_active_color(state) == BLUE
+
+
+def test_parse_args_defaults_match_module_defaults():
+    args = parse_args([])
+    assert args.smoke_url.startswith("http")
+    assert args.smoke_status == 200
+    assert args.smoke_attempts >= 1
+    assert args.smoke_timeout > 0
+    assert args.smoke_delay >= 0
+
+
+def test_parse_args_supports_smoke_url():
+    args = parse_args(["--smoke-url", "http://example.test/healthz"])
+    assert args.smoke_url == "http://example.test/healthz"
+
+
+def test_parse_args_supports_smoke_status_attempts_timeout_delay():
+    args = parse_args(
+        [
+            "--smoke-status",
+            "204",
+            "--smoke-attempts",
+            "10",
+            "--smoke-timeout",
+            "0.5",
+            "--smoke-delay",
+            "0.25",
+        ]
+    )
+    assert args.smoke_status == 204
+    assert args.smoke_attempts == 10
+    assert args.smoke_timeout == 0.5
+    assert args.smoke_delay == 0.25
