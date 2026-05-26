@@ -16,13 +16,19 @@ from scripts.rollout import (
     BLUE,
     COLORS,
     GREEN,
+    CutoverPlan,
     RolloutPlan,
     compose_up_command,
+    execute_cutover,
     execute_plan,
     next_color,
+    nginx_reload_command,
+    plan_cutover,
     plan_next_rollout,
     read_active_color,
+    render_upstream_conf,
     service_for_color,
+    upstream_directive_for_color,
     write_active_color,
 )
 
@@ -236,3 +242,243 @@ def test_rollout_plan_is_immutable():
     )
     with pytest.raises(Exception):
         plan.next_color = "blue"  # type: ignore[misc]
+
+
+def test_upstream_directive_for_blue_points_at_app_service():
+    body = upstream_directive_for_color(BLUE)
+    assert "server app:8000;" in body
+    assert "app_green" not in body
+
+
+def test_upstream_directive_for_green_points_at_app_green_service():
+    body = upstream_directive_for_color(GREEN)
+    assert "server app_green:8000;" in body
+
+
+def test_upstream_directive_respects_custom_port():
+    body = upstream_directive_for_color(BLUE, port=9090)
+    assert "server app:9090;" in body
+
+
+def test_upstream_directive_is_a_single_server_line():
+    """upstream.conf is included inside an existing `upstream {}` block,
+    so the rendered body must not declare its own upstream/server blocks."""
+    for color in COLORS:
+        body = upstream_directive_for_color(color)
+        assert "upstream" not in body
+        assert body.count("server ") == 1
+        assert body.rstrip().endswith(";")
+
+
+def test_upstream_directive_rejects_unknown_color():
+    with pytest.raises(ValueError):
+        upstream_directive_for_color("indigo")
+
+
+def test_render_upstream_conf_writes_file(tmp_path: Path):
+    path = tmp_path / "conf.d" / "upstream.conf"
+    render_upstream_conf(GREEN, path=path)
+    assert path.read_text(encoding="utf-8") == "server app_green:8000;\n"
+
+
+def test_render_upstream_conf_creates_parent_directory(tmp_path: Path):
+    path = tmp_path / "deeply" / "nested" / "upstream.conf"
+    render_upstream_conf(BLUE, path=path)
+    assert path.is_file()
+
+
+def test_render_upstream_conf_overwrites_existing_content(tmp_path: Path):
+    path = tmp_path / "upstream.conf"
+    render_upstream_conf(BLUE, path=path)
+    render_upstream_conf(GREEN, path=path)
+    body = path.read_text(encoding="utf-8")
+    assert "app_green" in body
+    assert body.count("server ") == 1, (
+        "rendering must REPLACE the file, not append — otherwise the next "
+        "cutover would leave both server directives in nginx's upstream"
+    )
+
+
+def test_nginx_reload_command_is_an_exec_into_proxy():
+    cmd = nginx_reload_command()
+    assert cmd[0] == "docker"
+    assert cmd[1] == "compose"
+    assert "exec" in cmd
+    idx = cmd.index("exec")
+    # -T disables TTY allocation so the command works in CI / non-interactive shells.
+    assert cmd[idx + 1] == "-T"
+    assert cmd[idx + 2] == "proxy"
+
+
+def test_nginx_reload_command_uses_signal_reload_not_restart():
+    """Step-4 invariant: traffic swap is graceful (SIGHUP), never a restart."""
+    cmd = nginx_reload_command()
+    assert "-s" in cmd
+    idx = cmd.index("-s")
+    assert cmd[idx + 1] == "reload"
+    for destructive in ("restart", "stop", "kill", "down", "rm"):
+        assert destructive not in cmd, (
+            f"nginx reload command must not include {destructive!r}: {cmd}"
+        )
+
+
+def test_nginx_reload_command_respects_project_name_and_compose_file():
+    cmd = nginx_reload_command(
+        project_name="custom",
+        compose_file=Path("/tmp/alt-compose.yml"),
+    )
+    assert "--project-name" in cmd
+    assert cmd[cmd.index("--project-name") + 1] == "custom"
+    assert "/tmp/alt-compose.yml" in cmd
+
+
+def test_nginx_reload_command_respects_proxy_service_name():
+    cmd = nginx_reload_command(proxy_service="edge_proxy")
+    assert "edge_proxy" in cmd
+    assert "proxy" not in [
+        cmd[i] for i in range(len(cmd)) if i != cmd.index("edge_proxy")
+    ] or list(cmd).count("proxy") == 0
+
+
+def test_plan_cutover_targets_green_when_blue_is_active(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    plan = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+    assert plan.from_color == BLUE
+    assert plan.to_color == GREEN
+    assert "server app_green:8000;" in plan.upstream_body
+
+
+def test_plan_cutover_targets_blue_when_green_is_active(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(GREEN, state)
+    plan = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+    assert plan.from_color == GREEN
+    assert plan.to_color == BLUE
+    assert "server app:8000;" in plan.upstream_body
+    assert "app_green" not in plan.upstream_body
+
+
+def test_plan_cutover_includes_reload_command(tmp_path: Path):
+    state = tmp_path / "active-color"
+    plan = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+    assert "-s" in plan.reload_command
+    assert "reload" in plan.reload_command
+
+
+def test_plan_cutover_does_not_touch_filesystem(tmp_path: Path):
+    """Planning is pure — the upstream file must not appear until execute."""
+    state = tmp_path / "active-color"
+    upstream = tmp_path / "u.conf"
+    plan_cutover(state_path=state, upstream_path=upstream)
+    assert not upstream.exists(), (
+        "plan_cutover must not write the upstream file — that side effect "
+        "belongs in execute_cutover so a caller can inspect the plan first"
+    )
+
+
+def test_cutover_plan_describe_renders_human_readable_summary(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    plan = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+    line = plan.describe()
+    assert "from=blue" in line
+    assert "to=green" in line
+    assert "app_green:8000" in line
+    assert "nginx" in line
+    assert "reload" in line
+
+
+def test_cutover_plan_is_immutable():
+    plan = CutoverPlan(
+        from_color=BLUE,
+        to_color=GREEN,
+        upstream_path=Path("/tmp/u.conf"),
+        upstream_body="server app_green:8000;\n",
+        reload_command=("docker", "compose", "exec", "proxy", "nginx", "-s", "reload"),
+    )
+    with pytest.raises(Exception):
+        plan.to_color = BLUE  # type: ignore[misc]
+
+
+def test_execute_cutover_writes_upstream_then_reloads_then_persists_state(
+    tmp_path: Path,
+):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_cutover(state_path=state, upstream_path=upstream)
+
+    events: list[tuple[str, object]] = []
+
+    def fake_runner(cmd):
+        events.append(("reload", tuple(cmd)))
+        # By the time the runner fires, the upstream file must already
+        # be in place — otherwise an out-of-band SIGHUP would race us.
+        events.append(("upstream_on_disk", upstream.read_text(encoding="utf-8")))
+        return 0
+
+    rc = execute_cutover(plan, runner=fake_runner, state_path=state)
+    assert rc == 0
+    assert upstream.read_text(encoding="utf-8") == "server app_green:8000;\n"
+    assert read_active_color(state) == GREEN
+    # The state file is committed AFTER the reload returns success.
+    kinds = [kind for kind, _ in events]
+    assert kinds == ["reload", "upstream_on_disk"], (
+        f"unexpected runner-side event order: {events}"
+    )
+    _, body_seen_by_nginx = events[1]
+    assert "app_green:8000" in body_seen_by_nginx
+
+
+def test_execute_cutover_leaves_state_unchanged_when_reload_fails(tmp_path: Path):
+    state = tmp_path / "active-color"
+    write_active_color(BLUE, state)
+    upstream = tmp_path / "upstream.conf"
+    plan = plan_cutover(state_path=state, upstream_path=upstream)
+
+    def failing_runner(_cmd):
+        return 1
+
+    rc = execute_cutover(plan, runner=failing_runner, state_path=state)
+    assert rc == 1
+    # Active-color must not advance when the proxy refused to reload —
+    # otherwise the next rollout would target blue, leaving green orphaned.
+    assert read_active_color(state) == BLUE
+
+
+def test_execute_cutover_propagates_arbitrary_runner_exit_code(tmp_path: Path):
+    state = tmp_path / "active-color"
+    plan = plan_cutover(state_path=state, upstream_path=tmp_path / "u.conf")
+
+    def fake_runner(_cmd):
+        return 42
+
+    assert execute_cutover(plan, runner=fake_runner, state_path=state) == 42
+
+
+def test_execute_cutover_creates_upstream_parent_directory(tmp_path: Path):
+    state = tmp_path / "active-color"
+    upstream = tmp_path / "fresh" / "conf.d" / "upstream.conf"
+    plan = plan_cutover(state_path=state, upstream_path=upstream)
+    execute_cutover(plan, runner=lambda _cmd: 0, state_path=state)
+    assert upstream.is_file()
+
+
+def test_round_trip_two_cutovers_swap_color_twice(tmp_path: Path):
+    """A blue→green→blue cycle must leave the proxy pointing back at blue."""
+    state = tmp_path / "active-color"
+    upstream = tmp_path / "upstream.conf"
+    runner = lambda _cmd: 0  # noqa: E731
+
+    plan1 = plan_cutover(state_path=state, upstream_path=upstream)
+    execute_cutover(plan1, runner=runner, state_path=state)
+    assert "app_green" in upstream.read_text(encoding="utf-8")
+    assert read_active_color(state) == GREEN
+
+    plan2 = plan_cutover(state_path=state, upstream_path=upstream)
+    execute_cutover(plan2, runner=runner, state_path=state)
+    body = upstream.read_text(encoding="utf-8")
+    assert "server app:8000;" in body
+    assert "app_green" not in body
+    assert read_active_color(state) == BLUE

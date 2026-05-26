@@ -195,3 +195,20 @@ def test_color_labels_are_set_on_both_services():
     green_color = get_label(green_labels, "com.vytharion.rollout.color")
     assert blue_color == "blue"
     assert green_color == "green"
+
+
+def test_proxy_mounts_upstream_conf_d_directory():
+    """Step 4 needs the proxy to see ``upstream.conf`` updates the rollout
+    script writes on the host — that means mounting the whole conf.d
+    directory, not just the static nginx.conf."""
+    compose = load_compose()
+    volumes = compose["services"]["proxy"].get("volumes", [])
+    conf_d_mounts = [v for v in volumes if "conf.d" in str(v)]
+    assert conf_d_mounts, (
+        "proxy must mount the nginx/conf.d directory so the rollout script "
+        "can swap upstream.conf and have nginx see it immediately"
+    )
+    target = "/etc/nginx/conf.d"
+    assert any(target in str(v) for v in conf_d_mounts), (
+        f"proxy's conf.d mount must target {target} inside the container"
+    )
