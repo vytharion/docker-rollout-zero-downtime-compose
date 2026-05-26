@@ -5,16 +5,26 @@ services:
     environment:
       APP_PORT: "8000"
       APP_VERSION: "v1"
+      APP_READY_AFTER_SECONDS: "0"
     expose:
       - "8000"
     networks:
       - edge
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/ready', timeout=2); sys.exit(0 if r.status == 200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
   proxy:
     image: nginx:1.27-alpine
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     ports:
       - "8080:80"
     volumes:

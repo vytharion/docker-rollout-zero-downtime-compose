@@ -66,6 +66,41 @@ def test_proxy_mounts_nginx_config_readonly():
     )
 
 
+def test_app_service_declares_a_healthcheck():
+    compose = load_compose()
+    app = compose["services"]["app"]
+    healthcheck = app.get("healthcheck")
+    assert healthcheck is not None, "app service must declare a healthcheck"
+    test_cmd = healthcheck.get("test")
+    assert test_cmd, "healthcheck must specify a test command"
+    joined = " ".join(test_cmd) if isinstance(test_cmd, list) else str(test_cmd)
+    assert "/ready" in joined, (
+        "healthcheck should probe the /ready readiness endpoint, not /health"
+    )
+
+
+def test_app_healthcheck_tunes_timing_for_rollouts():
+    compose = load_compose()
+    healthcheck = compose["services"]["app"]["healthcheck"]
+    for key in ("interval", "timeout", "retries", "start_period"):
+        assert key in healthcheck, (
+            f"healthcheck must set '{key}' so rollouts have predictable timing"
+        )
+
+
+def test_proxy_waits_for_app_to_be_healthy():
+    compose = load_compose()
+    depends = compose["services"]["proxy"].get("depends_on")
+    assert isinstance(depends, dict), (
+        "proxy.depends_on must use the long form to gate on app health"
+    )
+    app_dep = depends.get("app")
+    assert isinstance(app_dep, dict), "depends_on.app must be a mapping"
+    assert app_dep.get("condition") == "service_healthy", (
+        "proxy must wait for app to report service_healthy before starting"
+    )
+
+
 def test_services_share_a_user_defined_network():
     compose = load_compose()
     app_nets = set(compose["services"]["app"].get("networks", []))
