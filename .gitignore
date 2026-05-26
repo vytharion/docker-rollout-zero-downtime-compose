@@ -1,0 +1,25 @@
+# Operator-leak vectors (R-PRIV-01 defense-in-depth)
+.env
+*.pem
+*.key
+credentials.json
+.DS_Store
+
+# Workspace internals (never commit these to vytharion)
+CLAUDE.md
+.pipeline-state.json
+.pipeline-state.*.tmp
+
+# Common build / runtime artifacts (cleanup phase wipes these locally)
+node_modules/
+dist/
+build/
+target/
+.next/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.turbo/
+.vite/
+coverage/
